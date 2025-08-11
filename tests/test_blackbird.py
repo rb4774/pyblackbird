@@ -1,8 +1,12 @@
 import unittest
+import pytest
 
 import serial
 
-from pyblackbird import (get_blackbird, get_async_blackbird, ZoneStatus)
+from pyblackbird import (
+    get_blackbird, get_async_blackbird, get_async_blackbird_socket, ZoneStatus,
+    BlackbirdProtocolDetectionError, BlackbirdTimeoutError
+)
 from tests import (create_dummy_port, create_dummy_socket, HAS_PTY)
 import asyncio
 
@@ -181,16 +185,14 @@ class TestAsyncBlackbird(TestBlackbird):
         self.blackbird = DummyBlackbird()
 
     def test_timeout(self):
-        with self.assertRaises(asyncio.TimeoutError):
+        with pytest.raises(BlackbirdTimeoutError):
             self.blackbird.set_zone_source(6, 6)
 
 
 class TestBlackbirdSocketWindows(unittest.TestCase):
     """Fallback tests using TCP dummy server when PTY is unavailable (e.g. Windows)."""
 
-    # No setUp: each test creates its own isolated server/responses
-
-    @unittest.skipIf(HAS_PTY, "Only runs on platforms without PTY (Windows)")
+    @unittest.skipIf(HAS_PTY, "Only runs on platforms with no PTY (Windows-only test)")
     def test_legacy_status_over_socket(self):
         responses = {}
         host = create_dummy_socket(responses)
@@ -201,10 +203,9 @@ class TestBlackbirdSocketWindows(unittest.TestCase):
         self.assertEqual(status.av, 2)
         self.assertEqual(status.ir, 2)
 
-    @unittest.skipIf(HAS_PTY, "Only runs on platforms without PTY (Windows)")
+    @unittest.skipIf(HAS_PTY, "Only runs on platforms with no PTY (Windows-only test)")
     def test_ptn_multiline_status_over_socket(self):
         responses = {}
-        # Pre-populate initial multi-line response before client issues STA_VIDEO.
         responses[b'STA_VIDEO.'] = (
             b'Output 01 Switch To In 03!\r\n'
             b'Output 02 Switch To In 07!\r\n'
@@ -215,9 +216,7 @@ class TestBlackbirdSocketWindows(unittest.TestCase):
         self.assertEqual(st1.av, 3)
         st2 = bb.zone_status(2)
         self.assertEqual(st2.av, 7)
-        # Change a source
         responses[b'OUT01:05.'] = b'OK\n'
-        # Prepare updated status before issuing command to avoid race
         responses[b'STA_VIDEO.'] = (
             b'Output 01 Switch To In 05!\r\n'
             b'Output 02 Switch To In 07!\r\n'
@@ -226,7 +225,7 @@ class TestBlackbirdSocketWindows(unittest.TestCase):
         updated = bb.zone_status(1)
         self.assertEqual(updated.av, 5)
 
-    @unittest.skipIf(HAS_PTY, "Only runs on platforms without PTY (Windows)")
+    @unittest.skipIf(HAS_PTY, "Only runs on platforms with no PTY (Windows-only test)")
     def test_ptn_version_over_socket(self):
         responses = {b'STA.': (
             b'Please Input Your Command :\r\n'
@@ -255,3 +254,386 @@ class TestBlackbirdSocketWindows(unittest.TestCase):
 
 if __name__ == '__main__':
    unittest.main()
+
+# --- Additional PTN-specific tests (pytest style) ---
+
+def test_ptn_zone_status_caching():
+    """First call should populate cache; second call should not consume new STA_VIDEO. response."""
+    responses = {
+        b'STA_VIDEO.': (
+            b'Output 01 Switch To In 03!\r\n'
+            b'Output 02 Switch To In 07!\r\n'
+        )
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    st1 = bb.zone_status(1)
+    assert st1.av == 3
+    # Add a sentinel response that would be consumed if a second STA_VIDEO. were sent
+    responses[b'STA_VIDEO.'] = (
+        b'Output 01 Switch To In 09!\r\n'
+        b'Output 02 Switch To In 09!\r\n'
+    )
+    st2 = bb.zone_status(2)
+    assert st2.av == 7
+    # Cache prevented a second fetch
+    assert b'STA_VIDEO.' in responses
+
+
+def test_ptn_auto_detect_success():
+    """Auto-detect should identify PTN when STA_VIDEO. yields Output lines."""
+    responses = {
+        # Provide two identical responses: first for auto-detect probe, second for actual status fetch
+        b'STA_VIDEO.': [
+            (
+                b'Output 01 Switch To In 04!\r\n'
+                b'Output 02 Switch To In 05!\r\n'
+            ),
+            (
+                b'Output 01 Switch To In 04!\r\n'
+                b'Output 02 Switch To In 05!\r\n'
+            )
+        ]
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='auto', outputs=2)
+    # Internal protocol attribute should be PTN
+    assert getattr(bb, '_protocol_version') == 'ptn'
+    assert bb.zone_status(1).av == 4
+    assert bb.zone_status(2).av == 5
+
+
+def test_ptn_auto_detect_failure():
+    """Auto-detect should raise when neither PTN nor legacy responses match expected patterns."""
+    responses = {
+        b'STA_VIDEO.': b'Junk\r\n',           # No 'Output ' lines so PTN attempt fails
+        b'Status1.\r': b'Welcome Only\r\n',   # No 'AV:' / 'IR:' tokens so legacy fails
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    with pytest.raises(BlackbirdProtocolDetectionError):
+        get_blackbird(host, use_serial=False, protocol_version='auto', outputs=2)
+
+
+# --- Additional PTN coverage tests (socket-based) ---
+
+def test_ptn_version_parse_colon():
+    """Version line with 'Version:' pattern should be parsed."""
+    responses = {b'STA.': (
+        b'Please Input Your Command :\r\n'
+        b'GUI Or RS232 Query Status:\r\n'
+        b'Version: 2.3.4\r\n'
+        b'Output 01 Switch To In 01!\r\n'
+        b'Output 02 Switch To In 02!\r\n'
+    )}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    assert bb.version() == '2.3.4'
+
+
+def test_ptn_version_parse_equals():
+    """Version line with 'Version=' pattern should be parsed."""
+    responses = {b'STA.': (
+        b'Please Input Your Command :\r\n'
+        b'GUI Or RS232 Query Status:\r\n'
+        b'Version= 3.4.5\r\n'
+        b'Output 01 Switch To In 03!\r\n'
+        b'Output 02 Switch To In 04!\r\n'
+    )}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    assert bb.version() == '3.4.5'
+
+
+def test_ptn_version_parse_no_outputs():
+    """Version query with no Output lines should still succeed and leave cache empty."""
+    responses = {b'STA.': (
+        b'Please Input Your Command :\r\n'
+        b'Version: 9.9.9\r\n'
+    )}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    assert bb.version() == '9.9.9'
+    # Since no Output lines, status cache should remain empty until first zone_status call triggers STA_VIDEO.
+    assert getattr(bb, '_status_cache') == {}
+
+
+def test_ptn_refresh_status_repopulates_cache():
+    """refresh_status should clear and repopulate cache with new STA_VIDEO output."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 02!\r\n' b'Output 02 Switch To In 03!\r\n'),
+            (b'Output 01 Switch To In 05!\r\n' b'Output 02 Switch To In 06!\r\n'),
+        ]
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    first = bb.zone_status(1)
+    assert first.av == 2
+    # Now refresh; should consume second STA_VIDEO.
+    bb.refresh_status()
+    updated = bb.zone_status(1)
+    assert updated.av == 5
+
+
+def test_ptn_set_all_zone_source_invalidates_cache():
+    """set_all_zone_source should invalidate cache so subsequent status reflects new sources."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 02!\r\n' b'Output 02 Switch To In 03!\r\n'),
+            (b'Output 01 Switch To In 07!\r\n' b'Output 02 Switch To In 07!\r\n'),
+        ],
+        b'OUT00:07.': b'OK\r\n',
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    assert bb.zone_status(1).av == 2
+    bb.set_all_zone_source(7)
+    # After invalidation, second STA_VIDEO. response used
+    assert bb.zone_status(2).av == 7
+
+
+# --- Async socket client tests ---
+
+def test_async_socket_ptn_status_and_cache():
+    """Async PTN status fetch populates cache; second zone read uses cache without consuming new response."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 04!\r\n' b'Output 02 Switch To In 05!\r\n'),
+        ],
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=2)
+        st1 = await bb.zone_status(1)
+        assert st1.av == 4
+        # Provide a different response that should NOT be consumed because cache is used
+        responses[b'STA_VIDEO.'] = [
+            (b'Output 01 Switch To In 09!\r\n' b'Output 02 Switch To In 09!\r\n'),
+        ]
+        st2 = await bb.zone_status(2)
+        assert st2.av == 5
+        # Ensure modified response still present indicating cache use
+        assert b'STA_VIDEO.' in responses
+    asyncio.run(_run())
+
+
+def test_async_socket_ptn_cache_invalidation_after_source_change():
+    """Changing a zone source invalidates cache causing second STA_VIDEO fetch."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 01!\r\n' b'Output 02 Switch To In 02!\r\n'),
+            (b'Output 01 Switch To In 05!\r\n' b'Output 02 Switch To In 02!\r\n'),
+        ],
+        b'OUT01:05.': b'OK\r\n',
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=2)
+        st1 = await bb.zone_status(1)
+        assert st1.av == 1
+        await bb.set_zone_source(1, 5)  # invalidates cache
+        st1_updated = await bb.zone_status(1)
+        assert st1_updated.av == 5
+    asyncio.run(_run())
+
+
+def test_async_socket_ptn_version_and_status_cache_population():
+    """Version call populates firmware and status cache when Output lines included."""
+    responses = {
+        b'STA.': (
+            b'Please Input Your Command :\r\n'
+            b'Version: 6.6.6\r\n'
+            b'Output 01 Switch To In 03!\r\n'
+            b'Output 02 Switch To In 04!\r\n'
+        )
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=2)
+        ver = await bb.version()
+        assert ver == '6.6.6'
+        # After version() call cache should be primed
+        st2 = await bb.zone_status(2)
+        assert st2.av == 4
+    asyncio.run(_run())
+
+
+def test_async_socket_ptn_auto_detect():
+    """Auto protocol detection works in async socket client for PTN."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 07!\r\n' b'Output 02 Switch To In 08!\r\n'),  # for detect + first fetch
+            (b'Output 01 Switch To In 07!\r\n' b'Output 02 Switch To In 08!\r\n'),
+        ]
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='auto', outputs=2)
+        st1 = await bb.zone_status(1)
+        assert st1.av == 7
+        assert getattr(bb, '_protocol_version') == 'ptn'
+    asyncio.run(_run())
+
+
+def test_ptn_status_malformed_output_line_ignored():
+    """Malformed Output line should be ignored (only valid lines cached)."""
+    responses = {
+        b'STA_VIDEO.': [
+            (b'Output 01 Switch To In 02!\r\n'  # valid
+             b'Output 02 Switch To In AB!\r\n'  # malformed (non-numeric)
+            ),
+        ]
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    st1 = bb.zone_status(1)
+    assert st1.av == 2
+    # Zone 2 should not be present due to malformed line
+    assert bb.zone_status(2) is None
+
+
+def test_ptn_version_v_prefix_only():
+    """Version parsing should support standalone Vx.y.z line."""
+    responses = {b'STA.': (
+        b'Please Input Your Command :\r\n'
+        b'V2.0.0!\r\n'
+        b'Output 01 Switch To In 01!\r\n'
+    )}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=1)
+    assert bb.version() == '2.0.0'
+
+
+def test_async_socket_version_space_pattern():
+    """Async version parsing supports 'Version 4.5.6' (space, no colon)."""
+    responses = {b'STA.': (
+        b'Please Input Your Command :\r\n'
+        b'GUI Or RS232 Query Status:\r\n'
+        b'Version 4.5.6\r\n'
+        b'Output 01 Switch To In 03!\r\n'
+    )}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=1)
+        assert await bb.version() == '4.5.6'
+    asyncio.run(_run())
+
+
+def test_ptn_banner_skipped():
+    """Banner lines should be skipped when populating cache."""
+    responses = {b'STA_VIDEO.': [(
+        b'Please Input Your Command :\r\n'
+        b'Output 01 Switch To In 08!\r\n'
+    )]}
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=1)
+    st1 = bb.zone_status(1)
+    assert st1.av == 8
+
+
+def test_async_socket_auto_detect_failure():
+    """Async auto-detect should raise BlackbirdProtocolDetectionError when neither protocol matches."""
+    responses = {
+        b'STA_VIDEO.': [b'Junk\r\n'],
+        b'Status1.\r': b'Welcome Only\r\n'
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        with pytest.raises(BlackbirdProtocolDetectionError):
+            await get_async_blackbird_socket(host, protocol_version='auto', outputs=2)
+    asyncio.run(_run())
+
+
+def test_async_socket_timeout():
+    """Async socket client should raise BlackbirdTimeoutError when no response is received."""
+    responses = {}  # No responses provided; any command will hang until timeout
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        import pyblackbird as pb
+        original_timeout = pb.TIMEOUT
+        pb.TIMEOUT = 1  # shorten for test speed
+        try:
+            bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=1)
+            # Issue a command expecting at least a line terminator; none will arrive.
+            with pytest.raises(BlackbirdTimeoutError):
+                await bb.set_zone_source(1, 5)
+        finally:
+            pb.TIMEOUT = original_timeout
+    asyncio.run(_run())
+
+
+def test_async_socket_version_delayed_chunks():
+    """Simulate delayed multi-line STA. output arriving in chunks; ensure version captured."""
+    responses = {
+        b'STA.': {
+            'chunks': [
+                (b'GUI Or RS232 Query Status:\r\n8x8 HDMI Matrix\r\n', 0.05),
+                (b'24180\r\n', 0.05),
+                (b'V2.2.2\r\n', 0.05),
+                (b'Output 01 Switch To In 03!\r\n', 0.05),
+            ]
+        }
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+
+    async def _run():
+        bb = await get_async_blackbird_socket(host, protocol_version='ptn', outputs=1)
+        ver = await bb.version()
+        assert ver == '2.2.2'
+    asyncio.run(_run())
+
+
+def test_sync_socket_version_delayed_chunks():
+    """Sync client should also capture version from delayed chunked STA. output."""
+    responses = {
+        b'STA.': {
+            'chunks': [
+                (b'GUI Or RS232 Query Status:\r\n8x8 HDMI Matrix\r\n', 0.02),
+                (b'24180\r\nV3.3.3\r\n', 0.05),
+                (b'Output 01 Switch To In 01!\r\n', 0.02),
+            ]
+        }
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=1)
+    ver = bb.version()
+    assert ver == '3.3.3'
+
+
+def test_sync_socket_status_delayed_multiline():
+    """Delayed multi-line status (STA_VIDEO.) should still populate cache fully."""
+    responses = {
+        b'STA_VIDEO.': {
+            'chunks': [
+                (b'Output 01 Switch To In 02!\r\n', 0.03),
+                (b'Output 02 Switch To In 05!\r\n', 0.04),
+            ]
+        }
+    }
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=2)
+    st2 = bb.zone_status(2)
+    assert st2.av == 5
+
+
+def test_sync_socket_timeout():
+    """Sync socket client should raise BlackbirdTimeoutError when no response arrives."""
+    responses = {}  # No responses -> force timeout
+    host = create_dummy_socket(responses, banner=b'\r\n')
+    import pyblackbird as pb
+    original = pb.TIMEOUT
+    pb.TIMEOUT = 1  # shorten for test speed
+    try:
+        bb = get_blackbird(host, use_serial=False, protocol_version='ptn', outputs=1)
+        with pytest.raises(BlackbirdTimeoutError):
+            # Command expecting at least newline; server gives nothing.
+            bb.set_zone_source(1, 5)
+    finally:
+        pb.TIMEOUT = original

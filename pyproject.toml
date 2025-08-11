@@ -1,6 +1,6 @@
 [project]
 name = "pyblackbird"
-version = "0.6"
+version = "0.7.0"
 authors = [
   { name = "Ben Kools", email="koolsb@my.uwstout.edu" },
 ]
@@ -15,3 +15,7 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/koolsb/pyblackbird"
 "Bug Tracker" = "https://github.com/koolsb/pyblackbird/issues"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"

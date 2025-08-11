@@ -7,9 +7,14 @@ import socket
 from functools import wraps
 from serial_asyncio import create_serial_connection
 from threading import RLock
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Any, Callable, TypeVar, Awaitable
 
 _LOGGER = logging.getLogger(__name__)
+try:  # Single source version from installed metadata
+    from importlib.metadata import version as _pkg_version  # Python 3.8+
+    __version__ = _pkg_version('pyblackbird')
+except Exception:  # pragma: no cover - fallback during editable/source usage pre-install
+    __version__ = '0.0.0'
 ZONE_PATTERN_ON = re.compile(r'\D\D\D\s(\d\d)\D\D\d\d\s\s\D\D\D\s(\d\d)\D\D\d\d\s')
 ZONE_PATTERN_OFF = re.compile(r'\D\D\DOFF\D\D\d\d\s\s\D\D\D\D\D\D\D\D\d\d\s')
 EOL_LEGACY = b'\r'
@@ -23,19 +28,41 @@ TIMEOUT = 5 # Increased from 2 to better accommodate slower multi-line PTN respo
 PORT = 4001
 SOCKET_RECV = 2048
 
+# Exception hierarchy for clearer error handling
+class BlackbirdError(Exception):
+    """Base error for pyblackbird library."""
+
+
+class BlackbirdConnectionError(BlackbirdError):
+    """Raised when a connection to the device (TCP/serial) cannot be established."""
+
+
+class BlackbirdProtocolDetectionError(BlackbirdError):
+    """Raised when auto protocol detection fails to determine PTN vs legacy."""
+
+
+class BlackbirdTimeoutError(BlackbirdError):
+    """Raised when waiting for a device response exceeds timeout."""
+
+__all__ = [
+    'BlackbirdError', 'BlackbirdConnectionError', 'BlackbirdProtocolDetectionError', 'BlackbirdTimeoutError',
+    'get_blackbird', 'get_async_blackbird', 'get_async_blackbird_socket', 'ZoneStatus',
+    'PROTOCOL_LEGACY', 'PROTOCOL_PTN', 'PROTOCOL_AUTO'
+]
+
 class ZoneStatus(object):
     def __init__(self,
                  zone: int,
                  power: bool,
                  av: Optional[int],
                  ir: Optional[int]):
-        self.zone = zone
-        self.power = power
-        self.av = av
-        self.ir = ir
+        self.zone: int = zone
+        self.power: bool = power
+        self.av: Optional[int] = av
+        self.ir: Optional[int] = ir
 
     @classmethod
-    def from_string(cls, zone: int, string: str):
+    def from_string(cls, zone: int, string: Optional[str]) -> Optional['ZoneStatus']:
         """Parse legacy single-zone response string."""
         if not string:
             return None
@@ -44,41 +71,37 @@ class ZoneStatus(object):
             match_off = re.search(ZONE_PATTERN_OFF, string)
             if not match_off:
                 return None
-            return ZoneStatus(zone, 0, None, None)
-        return ZoneStatus(zone, 1, *[int(m) for m in match_on.groups()])
+            return ZoneStatus(zone, False, None, None)
+        return ZoneStatus(zone, True, *[int(m) for m in match_on.groups()])
 
     @classmethod
-    def from_ptn_protocol_line(cls, line: str):
+    def from_ptn_protocol_line(cls, line: str) -> Tuple[Optional[int], Optional['ZoneStatus']]:
         """Parse a single line of the PTN multi-line STA_VIDEO response.
 
         Expected format example: 'Output 01 Switch To In 04!' (CRLF stripped)
         Returns (zone, ZoneStatus) or (None, None) if not parsable.
         """
-        # Quick rejection
-        if not line or not line.startswith('Output '):
+        if not line or not line.startswith('Output '):  # Quick rejection
             return None, None
-        # Regex capturing output and input numbers
         m = re.match(r'Output\s+(\d+)\s+Switch\s+To\s+In\s+(\d+)!', line.strip())
         if not m:
             return None, None
         zone = int(m.group(1))
         source = int(m.group(2))
-    # PTN protocol lacks IR per-zone in status; assume power True
+        # PTN protocol lacks IR per-zone in status; assume power True
         return zone, ZoneStatus(zone, True, source, None)
 
 class LockStatus(object):
-    def __init__(self,
-                 lock: bool):
-        self.lock = lock
+    def __init__(self, lock: bool):
+        self.lock: bool = lock
 
     @classmethod
-    def from_string(cls, string: str):
+    def from_string(cls, string: Optional[str]) -> Optional[bool]:
         if not string:
             return None
         if string.startswith('System Locked'):
             return True
-        else:
-            return False
+        return False
 
 
 class Blackbird(object):
@@ -86,7 +109,7 @@ class Blackbird(object):
     Monoprice blackbird amplifier interface
     """
 
-    def zone_status(self, zone: int):
+    def zone_status(self, zone: int) -> Optional[ZoneStatus]:
         """
         Get the structure representing the status of the zone
         :param zone: zone 1..8
@@ -94,7 +117,7 @@ class Blackbird(object):
         """
         raise NotImplemented()
 
-    def set_zone_power(self, zone: int, power: bool):
+    def set_zone_power(self, zone: int, power: bool) -> None:
         """
         Turn zone on or off
         :param zone: Zone 1-8
@@ -102,7 +125,7 @@ class Blackbird(object):
         """
         raise NotImplemented()
 
-    def set_zone_source(self, zone: int, source: int):
+    def set_zone_source(self, zone: int, source: int) -> None:
         """
         Set source for zone
         :param zone: Zone 1-8
@@ -110,26 +133,26 @@ class Blackbird(object):
         """
         raise NotImplemented()
 
-    def set_all_zone_source(self, source: int):
+    def set_all_zone_source(self, source: int) -> None:
         """
         Set source for all zones
         :param source: integer from 1-8
         """
         raise NotImplemented()
 
-    def lock_front_buttons():
+    def lock_front_buttons(self) -> None:
         """
         Lock front panel buttons
         """
         raise NotImplemented()
 
-    def unlock_front_buttons():
+    def unlock_front_buttons(self) -> None:
         """
         Unlock front panel buttons
         """
         raise NotImplemented()
 
-    def lock_status():
+    def lock_status(self) -> Optional[bool]:
         """
         Report system locking status
         """
@@ -187,17 +210,34 @@ def _format_system_info(protocol_version: str) -> Optional[bytes]:
 def _detect_protocol_over_socket(host: str, timeout: float = 1.0) -> str:
     """Attempt to detect protocol by probing STA_VIDEO. then Status1. over TCP.
 
-    Returns protocol string (PROTOCOL_PTN or PROTOCOL_LEGACY) or raises RuntimeError.
+    Supports host or host:port (dynamic test dummy server). Returns protocol string
+    (PROTOCOL_PTN or PROTOCOL_LEGACY) or raises RuntimeError.
     """
+    # Allow "host:port" form (used by tests) falling back to default PORT
+    if ':' in host:
+        host_part, port_part = host.rsplit(':', 1)
+        try:
+            port = int(port_part)
+        except ValueError:
+            port = PORT
+    else:
+        host_part = host
+        port = PORT
+
+    # --- PTN attempt ---
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect((host, PORT))
         try:
-            s.recv(SOCKET_RECV)
+            s.connect((host_part, port))
+        except OSError as exc:
+            raise BlackbirdConnectionError(f"Connection failure during protocol detection to {host_part}:{port}: {exc}") from exc
+        try:  # Drain banner if present
+            banner = s.recv(SOCKET_RECV)
+            if banner and not (banner.startswith(b'Welcome') or banner.startswith(b'Please Input')):
+                _LOGGER.warning('Unrecognized banner during protocol detection: %r', banner[:64])
         except Exception:
             pass
-        # Try PTN first
         try:
             s.sendall(b'STA_VIDEO.')
             data = b''
@@ -206,8 +246,9 @@ def _detect_protocol_over_socket(host: str, timeout: float = 1.0) -> str:
                 if not chunk:
                     break
                 data += chunk
-                if b'Output ' in data:
+                if b'Output ' in data:  # PTN signature
                     return PROTOCOL_PTN
+                # If we encountered a line ending without PTN signature, stop this attempt
                 if b'\n' in data or b'\r' in data:
                     break
         except Exception:
@@ -218,11 +259,14 @@ def _detect_protocol_over_socket(host: str, timeout: float = 1.0) -> str:
         except Exception:
             pass
 
-    # Legacy attempt
+    # --- Legacy attempt ---
     s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s2.settimeout(timeout)
     try:
-        s2.connect((host, PORT))
+        try:
+            s2.connect((host_part, port))
+        except OSError as exc:
+            raise BlackbirdConnectionError(f"Connection failure during legacy protocol detection to {host_part}:{port}: {exc}") from exc
         try:
             s2.recv(SOCKET_RECV)
         except Exception:
@@ -235,9 +279,9 @@ def _detect_protocol_over_socket(host: str, timeout: float = 1.0) -> str:
                 if not chunk:
                     break
                 data += chunk
-                if b'AV:' in data and b'IR:' in data:
+                if b'AV:' in data and b'IR:' in data:  # Legacy signature
                     return PROTOCOL_LEGACY
-                if b'\r' in data:
+                if b'\r' in data:  # End of single-line response
                     break
         except Exception:
             pass
@@ -246,10 +290,11 @@ def _detect_protocol_over_socket(host: str, timeout: float = 1.0) -> str:
             s2.close()
         except Exception:
             pass
-    raise RuntimeError('Auto-detect failed (no recognizable PTN or legacy response).')
+
+    raise BlackbirdProtocolDetectionError('Auto-detect failed (no recognizable PTN or legacy response).')
 
 
-def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY, outputs: int = 8):
+def get_blackbird(url: str, use_serial: bool = True, protocol_version: str = PROTOCOL_LEGACY, outputs: int = 8) -> Blackbird:
     """
     Return synchronous version of Blackbird interface
     :param port_url: serial port, i.e. '/dev/ttyUSB0'
@@ -292,16 +337,27 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 self._port.open()
 
             else:
-                self.host = url
-                self.port = PORT
+                # Support host:port form for tests (dynamic dummy server ports)
+                if ':' in url:
+                    host_part, port_part = url.rsplit(':', 1)
+                    self.host = host_part
+                    try:
+                        self.port = int(port_part)
+                    except ValueError:  # fallback
+                        self.port = PORT
+                else:
+                    self.host = url
+                    self.port = PORT
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(TIMEOUT)
-                self.socket.connect((self.host, self.port))
+                try:
+                    self.socket.connect((self.host, self.port))
+                except OSError as exc:
+                    raise BlackbirdConnectionError(f"Could not connect to {self.host}:{self.port}: {exc}") from exc
 
                 # Clear login message
                 self.socket.recv(SOCKET_RECV)
-
-        def _process_request(self, request: bytes, skip=0, multiline: bool = False, expect_outputs: int = 0):
+        def _process_request(self, request: bytes, skip: int = 0, multiline: bool = False, expect_outputs: int = 0) -> str:
             """
             Send data to socket
             :param request: request that is sent to the blackbird
@@ -377,7 +433,10 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 response = ''
 
                 while True:
-                    data = self.socket.recv(SOCKET_RECV)
+                    try:
+                        data = self.socket.recv(SOCKET_RECV)
+                    except socket.timeout:
+                        raise BlackbirdTimeoutError(f"Timeout waiting for response to {request!r}")
                     if not data:
                         break
                     decoded = data.decode('ascii', errors='ignore')
@@ -386,6 +445,22 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                         outputs_found = sum(1 for l in response.splitlines() if l.startswith('Output '))
                         if expect_outputs and outputs_found >= expect_outputs:
                             break
+                        if not expect_outputs:
+                            # System info query: allow brief idle window after first newline to gather more lines
+                            if '\n' in decoded or '\r' in decoded:
+                                # Switch to short timeout to look for extra lines then exit on timeout / no data
+                                self.socket.settimeout(0.3)
+                                try:
+                                    while True:
+                                        extra = self.socket.recv(SOCKET_RECV)
+                                        if not extra:
+                                            break
+                                        response += extra.decode('ascii', errors='ignore')
+                                except Exception:
+                                    pass
+                                finally:
+                                    self.socket.settimeout(TIMEOUT)
+                                break
                     else:
                         if self._protocol_version == PROTOCOL_LEGACY and EOL_LEGACY in data and len(response) > skip:
                             break
@@ -394,7 +469,7 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 return response
 
         @synchronized
-        def zone_status(self, zone: int):
+        def zone_status(self, zone: int) -> Optional[ZoneStatus]:
             # Returns status of a zone
             if self._protocol_version == PROTOCOL_PTN:
                 if not self._status_cache:
@@ -409,12 +484,12 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 _format_zone_status_request(zone, self._protocol_version), skip=20))
 
         @synchronized
-        def set_zone_power(self, zone: int, power: bool):
+        def set_zone_power(self, zone: int, power: bool) -> None:
             # Set zone power
             self._process_request(_format_set_zone_power(zone, power, self._protocol_version))
 
         @synchronized
-        def set_zone_source(self, zone: int, source: int):
+        def set_zone_source(self, zone: int, source: int) -> None:
             # Set zone source
             # For new protocol, after changing source, refresh cache for accuracy
             self._process_request(_format_set_zone_source(zone, source, self._protocol_version))
@@ -422,24 +497,24 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 self._status_cache = {}
 
         @synchronized
-        def set_all_zone_source(self, source: int):
+        def set_all_zone_source(self, source: int) -> None:
             # Set all zones to one source
             self._process_request(_format_set_all_zone_source(source, self._protocol_version))
             if self._protocol_version == PROTOCOL_PTN:
                 self._status_cache = {}
 
         @synchronized
-        def lock_front_buttons(self):
+        def lock_front_buttons(self) -> None:
             # Lock front panel buttons
             self._process_request(_format_lock_front_buttons(self._protocol_version))
 
         @synchronized
-        def unlock_front_buttons(self):
+        def unlock_front_buttons(self) -> None:
             # Unlock front panel buttons
             self._process_request(_format_unlock_front_buttons(self._protocol_version))
 
         @synchronized
-        def lock_status(self):
+        def lock_status(self) -> Optional[bool]:
             # Report system locking status
             return LockStatus.from_string(self._process_request(_format_lock_status(self._protocol_version)))
 
@@ -458,7 +533,8 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
             cmd = _format_system_info(self._protocol_version)
             if not cmd:
                 return None
-            raw = self._process_request(cmd, multiline=True, expect_outputs=self._outputs)
+            # For system info, don't block waiting for all output lines; version appears early.
+            raw = self._process_request(cmd, multiline=True, expect_outputs=0)
             # Populate status cache from same response if not already
             if self._protocol_version == PROTOCOL_PTN and not self._status_cache:
                 self._parse_and_cache_ptn_status(raw)
@@ -467,7 +543,7 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
             return ver
 
         @synchronized
-        def refresh_status(self):
+        def refresh_status(self) -> bool:
             """Force a refresh of cached PTN status (no-op for legacy)."""
             if self._protocol_version == PROTOCOL_PTN:
                 self._status_cache = {}
@@ -475,7 +551,7 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
                 self.zone_status(1)
             return True
 
-        def _parse_and_cache_ptn_status(self, raw: str):
+        def _parse_and_cache_ptn_status(self, raw: str) -> None:
             """Parse multi-line PTN status output and populate cache, skipping banner."""
             cache: Dict[int, ZoneStatus] = {}
             for line in raw.splitlines():
@@ -489,7 +565,7 @@ def get_blackbird(url, use_serial=True, protocol_version: str = PROTOCOL_LEGACY,
     return BlackbirdSync(url)
 
 
-async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_LEGACY, outputs: int = 8):
+async def get_async_blackbird(port_url: str, loop: asyncio.AbstractEventLoop, protocol_version: str = PROTOCOL_LEGACY, outputs: int = 8) -> Blackbird:
     """
     Return asynchronous version of Blackbird interface
     :param port_url: serial port, i.e. '/dev/ttyUSB0'
@@ -498,7 +574,7 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
 
     lock = asyncio.Lock()
 
-    def locked_coro(coro):
+    def locked_coro(coro: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @wraps(coro)
         async def wrapper(*args, **kwargs):
             with (await lock):
@@ -512,8 +588,15 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
             self._outputs = outputs
             self._status_cache: Dict[int, ZoneStatus] = {}
 
+    class BlackbirdAsync(Blackbird):
+        def __init__(self, blackbird_protocol):
+            self._protocol = blackbird_protocol
+            self._protocol_version = protocol_version
+            self._outputs = outputs
+            self._status_cache: Dict[int, ZoneStatus] = {}
+
         @locked_coro
-        async def zone_status(self, zone: int):
+        async def zone_status(self, zone: int) -> Optional[ZoneStatus]:
             if self._protocol_version == PROTOCOL_PTN:
                 if not self._status_cache:
                     raw = await self._protocol.send(
@@ -528,31 +611,31 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
             return ZoneStatus.from_string(zone, string)
 
         @locked_coro
-        async def set_zone_power(self, zone: int, power: bool):
+        async def set_zone_power(self, zone: int, power: bool) -> None:
             await self._protocol.send(_format_set_zone_power(zone, power, self._protocol_version))
 
         @locked_coro
-        async def set_zone_source(self, zone: int, source: int):
+        async def set_zone_source(self, zone: int, source: int) -> None:
             await self._protocol.send(_format_set_zone_source(zone, source, self._protocol_version))
             if self._protocol_version == PROTOCOL_PTN:
                 self._status_cache = {}
 
         @locked_coro
-        async def set_all_zone_source(self, source: int):
-             await self._protocol.send(_format_set_all_zone_source(source, self._protocol_version))
-             if self._protocol_version == PROTOCOL_PTN:
-                 self._status_cache = {}
+        async def set_all_zone_source(self, source: int) -> None:
+            await self._protocol.send(_format_set_all_zone_source(source, self._protocol_version))
+            if self._protocol_version == PROTOCOL_PTN:
+                self._status_cache = {}
 
         @locked_coro
-        async def lock_front_buttons(self):
+        async def lock_front_buttons(self) -> None:
             await self._protocol.send(_format_lock_front_buttons(self._protocol_version))
 
         @locked_coro
-        async def unlock_front_buttons(self):
+        async def unlock_front_buttons(self) -> None:
             await self._protocol.send(_format_unlock_front_buttons(self._protocol_version))
 
         @locked_coro
-        async def lock_status(self):
+        async def lock_status(self) -> Optional[bool]:
             string = await self._protocol.send(_format_lock_status(self._protocol_version))
             return LockStatus.from_string(string)
 
@@ -565,20 +648,21 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
             cmd = _format_system_info(self._protocol_version)
             if not cmd:
                 return None
-            raw = await self._protocol.send(cmd, multiline=True, expect_outputs=self._outputs)
+            # Don't require all outputs for version query; version appears before output lines.
+            raw = await self._protocol.send(cmd, multiline=True, expect_outputs=0)
             if self._protocol_version == PROTOCOL_PTN and not self._status_cache:
                 self._parse_and_cache_ptn_status(raw)
             ver = _parse_version_from_system_info(raw)
             self._device_version = ver
             return ver
 
-        async def refresh_status(self):  # noqa: D401
+        async def refresh_status(self) -> bool:  # noqa: D401
             if self._protocol_version == PROTOCOL_PTN:
                 self._status_cache = {}
                 await self.zone_status(1)
             return True
 
-        def _parse_and_cache_ptn_status(self, raw: str):
+        def _parse_and_cache_ptn_status(self, raw: str) -> None:
             cache: Dict[int, ZoneStatus] = {}
             for line in raw.splitlines():
                 if line.startswith(BANNER_PREFIX):
@@ -602,10 +686,10 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
             self._connected.set()
             _LOGGER.debug('port opened %s', self._transport)
 
-        def data_received(self, data):
+        def data_received(self, data: bytes) -> None:
             asyncio.ensure_future(self.q.put(data), loop=self._loop)
 
-        async def send(self, request: bytes, skip=0, multiline: bool = False, expect_outputs: int = 0):
+        async def send(self, request: bytes, skip: int = 0, multiline: bool = False, expect_outputs: int = 0) -> str:
             await self._connected.wait()
             result = bytearray()
             # Only one transaction at a time
@@ -639,11 +723,172 @@ async def get_async_blackbird(port_url, loop, protocol_version: str = PROTOCOL_L
                                 return text
                 except asyncio.TimeoutError:
                     _LOGGER.error("Timeout during receiving response for command '%s', received='%s'", request, result)
-                    raise
+                    raise BlackbirdTimeoutError(f"Timeout waiting for response to {request!r}")
 
     _, protocol = await create_serial_connection(loop, functools.partial(BlackbirdProtocol, loop), port_url, baudrate=9600)
 
     return BlackbirdAsync(protocol)
+
+
+async def get_async_blackbird_socket(host: str, protocol_version: str = PROTOCOL_LEGACY, outputs: int = 8) -> Blackbird:
+    """Asynchronous TCP socket variant of the Blackbird client.
+
+    Supports legacy and PTN protocols plus 'auto' detection (socket only). Similar
+    feature set to the synchronous socket client but fully async using asyncio streams.
+    """
+    if protocol_version == PROTOCOL_AUTO:
+        # Use thread executor for blocking detection (small and immediate)
+        loop = asyncio.get_running_loop()
+        protocol_version = await loop.run_in_executor(None, _detect_protocol_over_socket, host)
+
+    # Parse host[:port]
+    if ':' in host:
+        host_part, port_part = host.rsplit(':', 1)
+        try:
+            port = int(port_part)
+        except ValueError:
+            port = PORT
+    else:
+        host_part = host
+        port = PORT
+
+    try:
+        reader, writer = await asyncio.open_connection(host_part, port)
+    except OSError as exc:
+        raise BlackbirdConnectionError(f"Async socket connect failed to {host_part}:{port}: {exc}") from exc
+
+    # Drain optional banner (non-blocking best-effort)
+    try:
+        await asyncio.wait_for(reader.read(256), timeout=0.2)
+    except asyncio.TimeoutError:  # pragma: no cover - banner absence
+        pass
+
+    lock = asyncio.Lock()
+
+    class AsyncBlackbirdSocket(Blackbird):
+        def __init__(self):
+            self._protocol_version = protocol_version
+            self._outputs = outputs
+            self._status_cache: Dict[int, ZoneStatus] = {}
+
+        async def _send(self, request: bytes, *, multiline: bool = False, expect_outputs: int = 0, skip: int = 0) -> str:
+            """Send a request and collect response text according to protocol rules."""
+            async with lock:
+                writer.write(request)
+                await writer.drain()
+                buf = ''
+                start = asyncio.get_running_loop().time()
+                outputs_found = 0
+                while True:
+                    # Timeout check
+                    if asyncio.get_running_loop().time() - start > TIMEOUT:
+                        raise BlackbirdTimeoutError(f"Timeout waiting for response to {request!r}")
+                    try:
+                        chunk = await asyncio.wait_for(reader.read(256), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not chunk:
+                        break
+                    decoded = chunk.decode('ascii', errors='ignore')
+                    buf += decoded
+                    if multiline:
+                        if self._protocol_version == PROTOCOL_PTN:
+                            outputs_found = sum(1 for l in buf.splitlines() if l.startswith('Output '))
+                            if expect_outputs and outputs_found >= expect_outputs:
+                                break
+                            if not expect_outputs and ('\n' in decoded or '\r' in decoded):
+                                # Allow a short idle window to accumulate possible additional lines
+                                idle_start = asyncio.get_running_loop().time()
+                                last_len = len(buf)
+                                while True:
+                                    if asyncio.get_running_loop().time() - idle_start > 0.35:
+                                        break
+                                    try:
+                                        more = await asyncio.wait_for(reader.read(256), timeout=0.1)
+                                    except asyncio.TimeoutError:
+                                        continue
+                                    if not more:
+                                        break
+                                    buf += more.decode('ascii', errors='ignore')
+                                    if len(buf) != last_len:
+                                        # Reset idle timer if new data arrived
+                                        idle_start = asyncio.get_running_loop().time()
+                                        last_len = len(buf)
+                                break
+                        else:  # legacy multiline not really used
+                            if '\r' in decoded:
+                                break
+                    else:
+                        if self._protocol_version == PROTOCOL_LEGACY and buf.endswith('\r') and len(buf) > skip:
+                            break
+                        if self._protocol_version == PROTOCOL_PTN and ('\n' in decoded or '\r' in decoded):
+                            break
+                return buf
+
+        async def zone_status(self, zone: int) -> Optional[ZoneStatus]:  # type: ignore[override]
+            if self._protocol_version == PROTOCOL_PTN:
+                if not self._status_cache:
+                    raw = await self._send(_format_zone_status_request(zone, self._protocol_version), multiline=True, expect_outputs=self._outputs)
+                    self._parse_and_cache_ptn_status(raw)
+                return self._status_cache.get(zone)
+            raw = await self._send(_format_zone_status_request(zone, self._protocol_version), skip=20)
+            return ZoneStatus.from_string(zone, raw)
+
+        async def set_zone_power(self, zone: int, power: bool) -> None:  # type: ignore[override]
+            await self._send(_format_set_zone_power(zone, power, self._protocol_version))
+
+        async def set_zone_source(self, zone: int, source: int) -> None:  # type: ignore[override]
+            await self._send(_format_set_zone_source(zone, source, self._protocol_version))
+            if self._protocol_version == PROTOCOL_PTN:
+                self._status_cache = {}
+
+        async def set_all_zone_source(self, source: int) -> None:  # type: ignore[override]
+            await self._send(_format_set_all_zone_source(source, self._protocol_version))
+            if self._protocol_version == PROTOCOL_PTN:
+                self._status_cache = {}
+
+        async def lock_front_buttons(self) -> None:  # type: ignore[override]
+            await self._send(_format_lock_front_buttons(self._protocol_version))
+
+        async def unlock_front_buttons(self) -> None:  # type: ignore[override]
+            await self._send(_format_unlock_front_buttons(self._protocol_version))
+
+        async def lock_status(self) -> Optional[bool]:  # type: ignore[override]
+            raw = await self._send(_format_lock_status(self._protocol_version))
+            return LockStatus.from_string(raw)
+
+        async def version(self) -> Optional[str]:  # type: ignore[override]
+            if self._protocol_version != PROTOCOL_PTN:
+                return None
+            if getattr(self, '_device_version', None):
+                return self._device_version
+            cmd = _format_system_info(self._protocol_version)
+            if not cmd:
+                return None
+            raw = await self._send(cmd, multiline=True, expect_outputs=0)
+            if not self._status_cache:
+                self._parse_and_cache_ptn_status(raw)
+            ver = _parse_version_from_system_info(raw)
+            self._device_version = ver
+            return ver
+
+        async def refresh_status(self) -> bool:  # type: ignore[override]
+            if self._protocol_version == PROTOCOL_PTN:
+                self._status_cache = {}
+                await self.zone_status(1)
+            return True
+
+        def _parse_and_cache_ptn_status(self, raw: str) -> None:
+            cache: Dict[int, ZoneStatus] = {}
+            for line in raw.splitlines():
+                if line.startswith(BANNER_PREFIX):
+                    continue
+                zone, status = ZoneStatus.from_ptn_protocol_line(line)
+                if zone is not None and status is not None:
+                    cache[zone] = status
+            self._status_cache = cache
+
+    return AsyncBlackbirdSocket()
 
 
 def _parse_version_from_system_info(raw: str) -> Optional[str]:

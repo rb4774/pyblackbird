@@ -8,7 +8,7 @@ This is for use with [Home-Assistant](http://home-assistant.io)
 
 ## Usage
 ```python
-from pyblackbird import get_blackbird
+from pyblackbird import get_blackbird, get_async_blackbird_socket
 
 # Connect via serial port
 blackbird = get_blackbird('/dev/ttyUSB0')
@@ -53,6 +53,34 @@ blackbird.unlock_front_buttons()
 
 ```
 
+### Asynchronous socket usage
+An asyncio-native TCP client is available (no serial dependency) supporting legacy, PTN, and auto protocol detection:
+
+```python
+import asyncio
+from pyblackbird import get_async_blackbird_socket
+
+async def main():
+	# Auto-detect protocol over TCP
+	bb = await get_async_blackbird_socket('192.168.1.50', protocol_version='auto', outputs=8)
+	# Fetch status (PTN caches all outputs on first call)
+	st1 = await bb.zone_status(1)
+	print('Zone1 source', st1.av)
+	# Change a source
+	await bb.set_zone_source(1, 5)
+	# Refresh cached PTN status explicitly
+	await bb.refresh_status()
+	# Firmware version (PTN only; returns None for legacy)
+	print('Firmware', await bb.version())
+
+asyncio.run(main())
+```
+
+Notes:
+* `protocol_version='auto'` performs the same probe sequence as the sync client.
+* Cache invalidation semantics (after source change or refresh) mirror the synchronous implementation.
+* For pure serial async control, continue using `get_async_blackbird` (existing serial protocol path).
+
 ### Protocol versions
 The library now supports two protocol variants:
 
@@ -72,6 +100,16 @@ print('Firmware version:', bb.version())  # e.g. 1.0.1
 ```
 
 The version is parsed from the multi-line `STA.` response (accepts either `Version:` lines or a standalone `V1.x.y` style string).
+
+Some firmware variants emit the version line only after several other status / output lines. The client now keeps the socket open briefly after the first newline to gather late-arriving lines. If version still returns `None`, run the async probe with `--debug-raw-version` to inspect the raw `STA.` response.
+
+### Library package version
+The library’s own package version is single-sourced from `pyproject.toml`. At runtime you can read it with:
+```python
+import pyblackbird
+print(pyblackbird.__version__)
+```
+When running directly from a source checkout without installing a wheel, this may show `0.0.0` (fallback) until the package is built/installed.
 
 ### Status caching and refresh
 For PTN devices the multi-line `STA_VIDEO.` response is parsed and cached per zone to avoid repeated full status fetches. After a source change the cache is invalidated automatically. You can force a refresh manually:
@@ -96,6 +134,12 @@ It will:
 * Force a fresh PTN status read with `--refresh`
 
 Windows / PowerShell users: this probe command is the recommended (and simplest) way to determine protocol and version—no extra PowerShell scripting required.
+
+An asynchronous variant with additional controls is available:
+```bash
+python -m examples.async_probe_blackbird <IP> --protocol auto --json --debug-raw-version
+```
+Use `--set Z:S` pairs to change sources (e.g. `--set 1:5 2:7`) and `--version-only` to print only firmware.
 
 ### Manual protocol test (netcat / nc)
 If you want to determine protocol quickly from a shell (e.g. your Home Assistant host) you can probe with `nc` (netcat). Replace `<IP>` with the matrix IP (default TCP port 4001).
@@ -153,4 +197,31 @@ Notes:
 
 ### Home Assistant integration notes
 When integrating into a Home Assistant config flow you can mimic the probe logic: attempt PTN first, fall back to legacy, then store the resolved protocol. Expose a manual override if detection fails. The provided `PROTOCOL_AUTO` constant and internal probing can simplify onboarding.
+
+### Exceptions
+The library now exposes a small exception hierarchy to make error handling explicit:
+
+* `BlackbirdError`: Base class (catch-all).
+* `BlackbirdConnectionError`: Failure to open / connect a TCP or serial connection.
+* `BlackbirdProtocolDetectionError`: Auto protocol detection failed (device didn’t yield recognizable PTN or legacy signatures).
+* `BlackbirdTimeoutError`: A command did not produce a complete response within the allotted timeout.
+
+Example:
+```python
+from pyblackbird import (
+	get_blackbird, BlackbirdConnectionError, BlackbirdProtocolDetectionError, BlackbirdTimeoutError
+)
+
+try:
+	bb = get_blackbird('192.168.1.50', use_serial=False, protocol_version='auto')
+	print(bb.version())
+except BlackbirdProtocolDetectionError:
+	print('Could not determine protocol; specify manually or check connectivity.')
+except BlackbirdConnectionError as e:
+	print('Connection failed:', e)
+except BlackbirdTimeoutError as e:
+	print('Device timed out:', e)
+```
+
+Timeout semantics: For PTN multi-line queries (e.g. `STA_VIDEO.` or `STA.`) a short idle grace period is applied to gather delayed lines before the overall timeout window is enforced.
 
